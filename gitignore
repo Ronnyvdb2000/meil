@@ -1,0 +1,23 @@
+# Environment & credentials — NOOIT committen!
+.env
+
+# Lokale database (test zonder Turso)
+*.db
+*.db-shm
+*.db-wal
+local_replica.db
+
+# Attachments (kunnen groot zijn)
+attachments/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
