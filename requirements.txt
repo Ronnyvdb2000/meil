@@ -1,2 +1,2 @@
-libsql-experimental
+requests
 python-dotenv
