@@ -61,12 +61,24 @@ class TursoDB:
         }
         self._pending = []  # batch van statements
 
-    def _execute(self, statements):
-        """Voer een lijst van {"type": "execute", "stmt": {...}} uit."""
+    def _execute(self, statements, retries=5, backoff=2):
+        """Voer een lijst van {"type": "execute", "stmt": {...}} uit, met retry bij 502/503."""
         payload = {"requests": statements + [{"type": "close"}]}
-        resp = requests.post(self.base_url, headers=self.headers, json=payload, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(retries):
+            try:
+                resp = requests.post(self.base_url, headers=self.headers, json=payload, timeout=30)
+                if resp.status_code in (502, 503, 504) and attempt < retries - 1:
+                    wait = backoff ** attempt
+                    print(f"  [~] Turso {resp.status_code}, wacht {wait}s en probeer opnieuw...")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.ConnectionError:
+                if attempt < retries - 1:
+                    time.sleep(backoff ** attempt)
+                    continue
+                raise
 
     def execute(self, sql, params=None):
         """Voer één statement uit en geef resultaat terug."""
