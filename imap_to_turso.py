@@ -35,14 +35,14 @@ import requests
 # ---------------------------------------------------------------------------
 
 CONFIG = {
-    "IMAP_HOST": os.environ.get("IMAP_HOST", "imap.online.be"),
+    "IMAP_HOST": os.environ.get("IMAP_HOST", "mail.online.be"),
     "IMAP_PORT": int(os.environ.get("IMAP_PORT", 993)),
     "IMAP_USER": os.environ.get("IMAP_USER", ""),
     "IMAP_PASS": os.environ.get("IMAP_PASS", ""),
     "TURSO_DATABASE_URL": os.environ.get("TURSO_DATABASE_URL", ""),
     "TURSO_AUTH_TOKEN": os.environ.get("TURSO_AUTH_TOKEN", ""),
     "ATTACHMENT_DIR": os.environ.get("ATTACHMENT_DIR", "./attachments"),
-    "BATCH_SIZE": 50,
+    "BATCH_SIZE": 25,   # berichten per Turso-batch
 }
 
 # ---------------------------------------------------------------------------
@@ -50,68 +50,65 @@ CONFIG = {
 # ---------------------------------------------------------------------------
 
 class TursoDB:
-    """Eenvoudige wrapper rond de Turso HTTP pipeline API."""
+    """Wrapper rond de Turso HTTP pipeline API met retry-logica."""
 
     def __init__(self, url, token):
-        # url: libsql://... → omzetten naar https://...
         self.base_url = url.replace("libsql://", "https://") + "/v2/pipeline"
         self.headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        self._pending = []  # batch van statements
 
-    def _execute(self, statements, retries=5, backoff=2):
-        """Voer een lijst van {"type": "execute", "stmt": {...}} uit, met retry bij 502/503."""
+    def _execute(self, statements, retries=6, backoff=2):
         payload = {"requests": statements + [{"type": "close"}]}
         for attempt in range(retries):
             try:
-                resp = requests.post(self.base_url, headers=self.headers, json=payload, timeout=30)
+                resp = requests.post(
+                    self.base_url, headers=self.headers,
+                    json=payload, timeout=60
+                )
                 if resp.status_code in (502, 503, 504) and attempt < retries - 1:
                     wait = backoff ** attempt
-                    print(f"  [~] Turso {resp.status_code}, wacht {wait}s en probeer opnieuw...")
+                    print(f"  [~] Turso {resp.status_code}, wacht {wait}s...")
                     time.sleep(wait)
                     continue
                 resp.raise_for_status()
                 return resp.json()
-            except requests.exceptions.ConnectionError:
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.ReadTimeout,
+                    requests.exceptions.Timeout):
                 if attempt < retries - 1:
-                    time.sleep(backoff ** attempt)
+                    wait = backoff ** attempt
+                    print(f"  [~] Turso timeout (poging {attempt+1}), wacht {wait}s...")
+                    time.sleep(wait)
                     continue
                 raise
 
-    def execute(self, sql, params=None):
-        """Voer één statement uit en geef resultaat terug."""
+    def _build_stmt(self, sql, params):
         stmt = {"sql": sql}
         if params:
-            stmt["named_parameters"] = [
-                {"name": f"p{i+1}", "value": self._to_value(v)}
-                for i, v in enumerate(params)
-            ]
-            # vervang ? door :p1, :p2, ...
-            for i in range(len(params)):
-                stmt["sql"] = stmt["sql"].replace("?", f":p{i+1}", 1)
+            args = []
+            new_sql = sql
+            for i, v in enumerate(params):
+                new_sql = new_sql.replace("?", f":p{i+1}", 1)
+                args.append({"name": f"p{i+1}", "value": self._to_value(v)})
+            stmt["sql"] = new_sql
+            stmt["named_parameters"] = args
+        return stmt
+
+    def execute(self, sql, params=None):
+        stmt = self._build_stmt(sql, params)
         result = self._execute([{"type": "execute", "stmt": stmt}])
         return result["results"][0]
 
     def executemany_batch(self, statements_with_params):
-        """Voer meerdere statements tegelijk uit (batch commit)."""
-        requests_list = []
-        for sql, params in statements_with_params:
-            stmt = {"sql": sql}
-            if params:
-                args = []
-                new_sql = sql
-                for i, v in enumerate(params):
-                    new_sql = new_sql.replace("?", f":p{i+1}", 1)
-                    args.append({"name": f"p{i+1}", "value": self._to_value(v)})
-                stmt["sql"] = new_sql
-                stmt["named_parameters"] = args
-            requests_list.append({"type": "execute", "stmt": stmt})
-        self._execute(requests_list)
+        reqs = [
+            {"type": "execute", "stmt": self._build_stmt(sql, params)}
+            for sql, params in statements_with_params
+        ]
+        self._execute(reqs)
 
     def executescript(self, sql):
-        """Voer meerdere statements uit (gescheiden door ;)."""
         statements = [s.strip() for s in sql.split(";") if s.strip()]
         reqs = [{"type": "execute", "stmt": {"sql": s}} for s in statements]
         self._execute(reqs)
@@ -124,6 +121,18 @@ class TursoDB:
             return {c["name"]: rows[0][i]["value"] for i, c in enumerate(cols)}
         return None
 
+    def fetchall(self, sql, params=None):
+        result = self.execute(sql, params)
+        rows = result.get("response", {}).get("result", {}).get("rows", [])
+        if not rows:
+            return []
+        cols = result["response"]["result"]["cols"]
+        return [{c["name"]: row[i]["value"] for i, c in enumerate(cols)} for row in rows]
+
+    def last_insert_id(self):
+        result = self.fetchone("SELECT last_insert_rowid() as id")
+        return int(result["id"]) if result else None
+
     def _to_value(self, v):
         if v is None:
             return {"type": "null", "value": None}
@@ -132,10 +141,6 @@ class TursoDB:
         if isinstance(v, float):
             return {"type": "float", "value": v}
         return {"type": "text", "value": str(v)}
-
-    def last_insert_id(self):
-        result = self.fetchone("SELECT last_insert_rowid() as id")
-        return int(result["id"]) if result else None
 
 
 # ---------------------------------------------------------------------------
@@ -301,17 +306,22 @@ def import_folder(imap_conn, db, folder_name, attachment_dir):
     uids = data[0].split()
     print(f"  [*] {folder_name}: {len(uids)} berichten")
 
+    # Haal ALLE bestaande UIDs voor deze map in één call op
+    existing_rows = db.fetchall(
+        "SELECT uid FROM messages WHERE folder = ?",
+        (folder_name,)
+    )
+    existing_uids = {row["uid"] for row in existing_rows}
+    print(f"      {len(existing_uids)} al in database, {len(uids) - len(existing_uids)} nieuw")
+
     count = 0
-    batch = []
+    batch_insert = []
+    batch_attachments = []
 
     for i, uid in enumerate(uids, 1):
         uid_str = uid.decode()
 
-        existing = db.fetchone(
-            "SELECT id FROM messages WHERE folder = ? AND uid = ?",
-            (folder_name, uid_str)
-        )
-        if existing:
+        if uid_str in existing_uids:
             continue
 
         try:
@@ -328,9 +338,9 @@ def import_folder(imap_conn, db, folder_name, attachment_dir):
             subject = decode_str(msg.get("Subject"))
             date_sent = msg.get("Date", "")
             message_id = msg.get("Message-ID", "")
-
             body_text, body_html = get_body(msg)
 
+            # Direct INSERT per bericht (attachments hebben de nieuwe ID nodig)
             db.execute(
                 """INSERT OR IGNORE INTO messages
                    (folder, uid, message_id, from_addr, to_addr, cc_addr,
@@ -340,27 +350,25 @@ def import_folder(imap_conn, db, folder_name, attachment_dir):
                  subject, date_sent, body_text, body_html, len(raw_email))
             )
 
-            row = db.fetchone(
-                "SELECT id FROM messages WHERE folder = ? AND uid = ?",
-                (folder_name, uid_str)
-            )
-            msg_db_id = int(row["id"]) if row else None
+            msg_db_id = db.last_insert_id()
 
             if msg_db_id:
                 attachments = extract_attachments(msg, msg_db_id, attachment_dir)
                 if attachments:
-                    db.execute("UPDATE messages SET has_attachments = 1 WHERE id = ?", (msg_db_id,))
+                    att_stmts = []
                     for filename, content_type, file_path, file_size in attachments:
-                        db.execute(
-                            """INSERT INTO attachments
-                               (message_id, filename, content_type, file_path, file_size)
-                               VALUES (?, ?, ?, ?, ?)""",
+                        att_stmts.append((
+                            "INSERT INTO attachments (message_id, filename, content_type, file_path, file_size) VALUES (?, ?, ?, ?, ?)",
                             (msg_db_id, filename, content_type, file_path, file_size)
-                        )
+                        ))
+                    db.executemany_batch(att_stmts)
+                    db.execute("UPDATE messages SET has_attachments = 1 WHERE id = ?", (msg_db_id,))
 
+            existing_uids.add(uid_str)
             count += 1
+
             if count % CONFIG["BATCH_SIZE"] == 0:
-                print(f"      ... {count}/{len(uids)} verwerkt")
+                print(f"      ... {count} nieuw verwerkt")
 
         except Exception as e:
             print(f"  [!] Fout bij bericht uid={uid_str} in {folder_name}: {e}")
